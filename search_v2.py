@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""批次下載臺北市環境品質資訊網的 AQI 小時資料。
+"""使用 BeautifulSoup 批次下載臺北市 AQI 小時資料報表。
 
 網站：https://www.tldep.gov.taipei/Public/DownLoad/AqiHour.aspx
 
 範例：
-    python serch.py --stations 中正,大安 --start 2026-08-01 --end 2026-09-06
-    python serch.py --stations all --start 2026/08/01 --end 2026/09/06
+    python search_v2.py --stations 中正,大安 --start 2026-08-01 --end 2026-09-06
+    python search_v2.py --stations all --start 2026/08/01 --end 2026/09/06
 
-若未提供參數，程式會以互動方式詢問測站與日期。網站輸出為 Excel 可開啟的
+若沒有提供參數，程式會進入互動模式。網站實際輸出為 Excel 可開啟的
 OpenDocument 試算表（.ods）。
 """
 
@@ -20,7 +20,6 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import unquote
@@ -28,6 +27,11 @@ from urllib.parse import unquote
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None  # type: ignore[assignment]
 
 
 URL = "https://www.tldep.gov.taipei/Public/DownLoad/AqiHour.aspx"
@@ -43,56 +47,19 @@ class StationField:
     value: str
 
 
-class AqiFormParser(HTMLParser):
-    """只解析下載表單所需的 hidden 欄位與測站 checkbox。"""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.hidden: dict[str, str] = {}
-        self._checkboxes_by_id: dict[str, StationField] = {}
-        self.stations: dict[str, StationField] = {}
-        self._label_for: str | None = None
-        self._label_text: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attributes = dict(attrs)
-        if tag == "input":
-            input_type = (attributes.get("type") or "text").lower()
-            name = attributes.get("name")
-            if input_type == "hidden" and name:
-                self.hidden[name] = attributes.get("value") or ""
-            elif input_type == "checkbox" and name:
-                element_id = attributes.get("id")
-                if element_id:
-                    self._checkboxes_by_id[element_id] = StationField(
-                        name=name,
-                        value=attributes.get("value") or "on",
-                    )
-        elif tag == "label":
-            self._label_for = attributes.get("for")
-            self._label_text = []
-
-    def handle_data(self, data: str) -> None:
-        if self._label_for is not None:
-            self._label_text.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "label" and self._label_for is not None:
-            label = "".join(self._label_text).strip()
-            field = self._checkboxes_by_id.get(self._label_for)
-            if label and field:
-                self.stations[label] = field
-            self._label_for = None
-            self._label_text = []
+@dataclass(frozen=True)
+class FormData:
+    hidden: dict[str, str]
+    stations: dict[str, StationField]
 
 
 class CompatibleTLSAdapter(HTTPAdapter):
-    """相容缺少 Subject Key Identifier、但憑證鏈仍有效的舊式站台。"""
+    """相容目標網站的舊式憑證，同時保留 CA 與主機名稱驗證。"""
 
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
         context = ssl.create_default_context()
-        # Python 3.13 / OpenSSL 3 的嚴格模式會拒絕目標站目前的憑證。
-        # 僅關閉 X509 strict；CA 憑證鏈與 hostname 驗證仍維持開啟。
+        # 新版 OpenSSL 的 strict 模式會因該站憑證缺少 SKI 而拒絕連線。
+        # 只停用 X509 strict；不使用 verify=False。
         if hasattr(ssl, "VERIFY_X509_STRICT"):
             context.verify_flags &= ~ssl.VERIFY_X509_STRICT
         pool_kwargs["ssl_context"] = context
@@ -110,7 +77,7 @@ def parse_date(value: str) -> date:
 
 
 def split_date_range(start: date, end: date) -> Iterable[tuple[date, date]]:
-    """切成每批最多 30 個日曆日（起訖日都計入）。"""
+    """切成每批最多 30 個日曆日，開始日與結束日都計入。"""
     if start > end:
         raise ValueError("開始日期不可晚於結束日期")
 
@@ -144,16 +111,51 @@ def make_session() -> requests.Session:
     return session
 
 
-def read_form(session: requests.Session, timeout: float) -> AqiFormParser:
+def parse_form(html: str) -> FormData:
+    """以 BeautifulSoup 擷取 ASP.NET 隱藏欄位及測站 checkbox。"""
+    if BeautifulSoup is None:
+        raise RuntimeError(
+            "缺少 BeautifulSoup，請先執行：pip install beautifulsoup4"
+        )
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    hidden: dict[str, str] = {}
+    for element in soup.select('input[type="hidden"][name]'):
+        name = element.get("name")
+        if isinstance(name, str):
+            value = element.get("value", "")
+            hidden[name] = value if isinstance(value, str) else ""
+
+    stations: dict[str, StationField] = {}
+    selector = '#CPH_Content_cbl_site input[type="checkbox"][name]'
+    for checkbox in soup.select(selector):
+        element_id = checkbox.get("id")
+        field_name = checkbox.get("name")
+        if not isinstance(element_id, str) or not isinstance(field_name, str):
+            continue
+
+        label = soup.find("label", attrs={"for": element_id})
+        if label is None:
+            continue
+        station_name = label.get_text(" ", strip=True)
+        field_value = checkbox.get("value", "on")
+        if station_name:
+            stations[station_name] = StationField(
+                name=field_name,
+                value=field_value if isinstance(field_value, str) else "on",
+            )
+
+    if "__VIEWSTATE" not in hidden or not stations:
+        raise RuntimeError("無法解析下載表單；網站版面或欄位可能已變更")
+    return FormData(hidden=hidden, stations=stations)
+
+
+def read_form(session: requests.Session, timeout: float) -> FormData:
     response = session.get(URL, timeout=timeout)
     response.raise_for_status()
     response.encoding = response.apparent_encoding or "utf-8"
-
-    parser = AqiFormParser()
-    parser.feed(response.text)
-    if "__VIEWSTATE" not in parser.hidden or not parser.stations:
-        raise RuntimeError("無法解析下載表單；網站版面或欄位可能已變更")
-    return parser
+    return parse_form(response.text)
 
 
 def normalize_station_names(raw: str, available: Iterable[str]) -> list[str]:
@@ -173,6 +175,9 @@ def normalize_station_names(raw: str, available: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+# 抓取 filename*=UTF-8''後面的文字()
+# 或者
+# 抓取 filename=後面的文字
 def extension_from_response(response: requests.Response) -> str:
     content_type = response.headers.get("Content-Type", "").lower()
     disposition = response.headers.get("Content-Disposition", "")
@@ -199,14 +204,20 @@ def looks_like_html(response: requests.Response) -> bool:
     return "text/html" in content_type or prefix.startswith((b"<!doctype html", b"<html"))
 
 
-def extract_page_message(content: bytes, encoding: str | None) -> str:
-    text = content.decode(encoding or "utf-8", errors="replace")
-    # 將伺服器回傳的 HTML 濃縮，方便看出驗證失敗或維護訊息。
-    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=re.I | re.S)
-    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return re.sub(r"\s+", " ", text).strip()[:300]
+def extract_page_message(response: requests.Response) -> str:
+    """利用 BeautifulSoup 將伺服器錯誤頁面轉成簡短純文字。"""
+    if BeautifulSoup is None:
+        return "無法解析網站錯誤頁面"
+    response.encoding = response.apparent_encoding or response.encoding or "utf-8"
+    soup = BeautifulSoup(response.text, "html.parser")
+    for element in soup(["script", "style"]):
+        #把這些元素及其內容完全移除，避免錯誤摘要包含 JavaScript 或css
+        element.decompose()
 
+    return re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:300]
+    # re.sub(搜尋規則, 替換內容, 原始文字)
+    # soup.get_text(" ", strip=True) 取得網頁中的純文字，以空格分隔不同元素，並移除前後空白。
+    
 
 def download_batch(
     session: requests.Session,
@@ -216,7 +227,7 @@ def download_batch(
     output_dir: Path,
     timeout: float,
 ) -> Path:
-    # 每批重新 GET，以取得仍有效的 ASP.NET ViewState/EventValidation。
+    # 每批重新讀取頁面，以取得仍有效的 ViewState 和 EventValidation。
     form = read_form(session, timeout)
     missing = [name for name in stations if name not in form.stations]
     if missing:
@@ -242,8 +253,9 @@ def download_batch(
     )
     response.raise_for_status()
     if looks_like_html(response):
-        message = extract_page_message(response.content, response.encoding)
-        raise RuntimeError(f"網站未回傳試算表。頁面內容摘要：{message}")
+        raise RuntimeError(
+            "網站未回傳試算表。頁面內容摘要：" + extract_page_message(response)
+        )
     if not response.content:
         raise RuntimeError("網站回傳空白檔案")
 
@@ -258,11 +270,11 @@ def download_batch(
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="下載臺北市環境品質資訊網 AQI 小時資料（自動切成每批最多 30 日）"
+        description="以 BeautifulSoup 下載 AQI 小時資料（每批最多 30 日）"
     )
     parser.add_argument(
         "--stations",
-        help="測站名稱，以逗號分隔；輸入 all 代表全部測站，例如：中正,大安",
+        help="測站名稱，以逗號分隔；all 代表全部，例如：中正,大安",
     )
     parser.add_argument("--start", type=parse_date, help="開始日期，YYYY-MM-DD")
     parser.add_argument("--end", type=parse_date, help="結束日期，YYYY-MM-DD")
@@ -282,7 +294,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=60.0,
-        help="每個 HTTP 請求的逾時秒數（預設：60）",
+        help="HTTP 請求逾時秒數（預設：60）",
     )
     parser.add_argument(
         "--list-stations",
@@ -294,6 +306,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_argument_parser().parse_args()
+    if BeautifulSoup is None:
+        raise RuntimeError("缺少套件，請先執行：pip install beautifulsoup4")
     if args.delay < 0:
         raise ValueError("--delay 不可小於 0")
     if args.timeout <= 0:
