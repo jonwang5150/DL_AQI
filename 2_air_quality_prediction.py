@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 # 此資料集為20250812-20260811木柵觀測站空氣品質資料，每一小時會監測一次空氣中各個氣體或汙染物濃度，並計算出AQI
 #df = pd.read_csv("20260515_20260615.csv",encoding='utf8')
-# df = pd.read_csv("AQI_dataset/20250812-20260811.csv",encoding='utf-8-sig')
+#df = pd.read_csv("20250812-20260811.csv",encoding='utf-8-sig')
 df = pd.read_csv("aqi_hour_concat.csv",encoding='utf-8-sig')
 
 
