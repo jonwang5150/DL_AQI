@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import pickle
+from pyexpat import features
 import sys
 from pathlib import Path
 
@@ -157,11 +158,14 @@ def main() -> int:
         raise ValueError(f"資料庫查詢結果缺少模型特徵：{', '.join(sorted(missing_features))}")
     for feature in features:
         data[feature] = pd.to_numeric(data[feature], errors="coerce")
+    # 僅使用過去觀測值進行前向補值，避免補值時使用未來資料。
     missing_before = int(data[features].isna().sum().sum())
-    # 與模型訓練時的 data_cleaning.load_and_clean_data 保持一致。
-    data.loc[:, features] = data[features].interpolate(method="linear", limit_direction="both")
+    data.loc[:, features] = data[features].ffill()
+    
     if data[features].isna().any().any():
         raise ValueError("模型特徵補值後仍含空值，無法建立預測視窗")
+
+ 
 
     scaled_data = data.copy()
     scaled_data.loc[:, features] = (data[features].to_numpy(dtype=float) - scaler_mean) / scaler_scale
@@ -189,7 +193,7 @@ def main() -> int:
     print(f"測站：{args.station}")
     print(f"預測時段：{PREDICTION_START} 至 {PREDICTION_END}（不含結束時間）")
     print(f"補齊缺少的逐時資料：{missing_hours} 筆")
-    print(f"污染物欄位線性補值：{missing_before} 格")
+    print(f"污染物欄位前向補值：{missing_before} 格")
     print(f"完成 {len(result)} 筆逐時 AQI 預測：{args.output.resolve()}")
     return 0
 
