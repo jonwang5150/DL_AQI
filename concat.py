@@ -39,8 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("aqi_hour_concat.csv"),
-        help="輸出的 CSV 路徑（預設：aqi_hour_concat.csv）",
+        default=Path("20250101-20251231.csv"),
+        help="輸出的 CSV 路徑（預設：20250101-20251231.csv）",
     )
     return parser
 

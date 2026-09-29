@@ -4,8 +4,8 @@
 安裝：python -m pip install "SQLAlchemy>=2.0,<2.1" "psycopg[binary]>=3,<4"
 設定：修改 config.py 的資料庫連線網址與 Settings 內的匯入設定。
 執行：直接在 IDE 執行本檔，或 python csv_to_postgres.py。
-匯入：python csv_to_postgres.py aqi_hour_concat.csv
-檢查：python csv_to_postgres.py aqi_hour_concat.csv --dry-run
+匯入：python csv_to_postgres.py 20250101-20251231.csv
+檢查：python csv_to_postgres.py 20250101-20251231.csv --dry-run
 
 資料庫須先建立；程式會建立 public.air_quality_hourly 資料表。
 日期保留 CSV 的台灣當地時間，不進行時區轉換。
