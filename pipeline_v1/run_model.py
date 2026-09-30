@@ -5,17 +5,25 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from data_cleaning import load_and_clean_data
-from data_split import prepare_datasets
-from model import LSTMModel, save_checkpoint
-from predict import predict_next_hour
-from train import evaluate_model, train_model
-from visualization import show_visualizations
+try:
+    from .data_cleaning import load_and_clean_data
+    from .data_split import prepare_datasets
+    from .model import LSTMModel, save_checkpoint
+    from .predict import predict_next_hour
+    from .train import evaluate_model, train_model
+    from .visualization import show_visualizations
+except ImportError:  # 支援 python pipeline_v1/run_model.py
+    from data_cleaning import load_and_clean_data
+    from data_split import prepare_datasets
+    from model import LSTMModel, save_checkpoint
+    from predict import predict_next_hour
+    from train import evaluate_model, train_model
+    from visualization import show_visualizations
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the AQI LSTM prediction pipeline")
-    parser.add_argument("--data", type=Path, default=Path("aqi_hour_concat.csv"))
+    parser.add_argument("--data", type=Path, default=Path("20250101-20251231.csv"))
     parser.add_argument("--model", type=Path, default=Path("aqi_lstm_model.pth"))
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--window-size", type=int, default=24)

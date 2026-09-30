@@ -6,7 +6,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from model import LSTMModel
+try:
+    from .model import LSTMModel
+except ImportError:  # 支援直接執行 pipeline_v1 內的程式
+    from model import LSTMModel
 
 
 def train_model(
