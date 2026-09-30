@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from visualization import show_prediction_visualization
+from feature_visualizations import show_prediction_visualization
 
 
 PROJECT_DIR = Path(__file__).resolve().parent

@@ -18,8 +18,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from config import settings
 from csv_to_postgres import database_url_from_settings
 from db_models import AirQualityHourly
-from model import LSTMModel
-from predict import predict_period
+from pipeline_v1.model import LSTMModel
+from predict_feture import predict_period
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
