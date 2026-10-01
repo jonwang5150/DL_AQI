@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""顯示 predict_2026.csv 的互動式 AQI 預測圖表。"""
+"""顯示最新 AQI 預測 CSV 的互動式圖表。"""
 
 from __future__ import annotations
 
@@ -13,12 +13,22 @@ from feature_visualizations import show_prediction_visualization
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
+def find_default_prediction_csv() -> Path:
+    """選擇最近產生的日期區間預測檔。"""
+    candidates = list(PROJECT_DIR.glob("*-*_predict.csv"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"找不到預測結果：{PROJECT_DIR / '*-*_predict.csv'}"
+        )
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--data",
         type=Path,
-        default=PROJECT_DIR / "predict_2026.csv",
+        default=find_default_prediction_csv(),
         help="預測結果 CSV 路徑",
     )
     parser.add_argument(

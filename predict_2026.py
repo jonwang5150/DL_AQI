@@ -27,6 +27,13 @@ PREDICTION_START = pd.Timestamp("2026-01-01 00:00:00")
 PREDICTION_END = pd.Timestamp("2026-08-01 00:00:00")
 
 
+def default_output_path() -> Path:
+    """依預測起訖日期產生預設輸出檔名。"""
+    start_text = PREDICTION_START.strftime("%Y%m%d")
+    end_text = PREDICTION_END.strftime("%Y%m%d")
+    return PROJECT_DIR / f"{start_text}-{end_text}_predict.csv"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--station", default="木柵站", help="資料庫中的測站名稱")
@@ -39,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=PROJECT_DIR / "predict_2026.csv",
+        default=default_output_path(),
         help="預測結果 CSV 路徑",
     )
     return parser
