@@ -3,9 +3,9 @@
 
 安裝：python -m pip install "SQLAlchemy>=2.0,<2.1" "psycopg[binary]>=3,<4"
 設定：修改 config.py 的資料庫連線網址與 Settings 內的匯入設定。
-執行：直接在 IDE 執行本檔，或 python csv_to_postgres.py。
-匯入：python csv_to_postgres.py 20250101-20251231.csv
-檢查：python csv_to_postgres.py 20250101-20251231.csv --dry-run
+執行：直接在 IDE 執行本檔，或 python update_db.py。
+匯入：python update_db.py 20250101-20251231.csv
+檢查：python update_db.py 20250101-20251231.csv --dry-run
 
 資料庫須先建立；程式會建立 public.air_quality_hourly 資料表。
 日期保留 CSV 的台灣當地時間，不進行時區轉換。
@@ -21,7 +21,7 @@ import sys
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 
 COLUMNS = ["測站", "日期", "AQI", "空氣品質指標", "O3", "PM2.5", "PM10", "CO", "SO2", "NO2"]
@@ -78,6 +78,23 @@ def parse_number(value: str, column: str) -> Decimal | None:
     return number
 
 
+def parse_row(raw: dict[str, str]) -> dict:
+    """CSV 與爬蟲共用的資料驗證與轉換。"""
+    if set(raw) != set(COLUMNS):
+        raise ValueError("資料欄位與預期不符")
+    row = {key: value.strip() for key, value in raw.items()}
+    if not row["測站"]:
+        raise ValueError("測站不可空白")
+    observed_at = datetime.strptime(row["日期"], "%Y/%m/%d %H:%M")
+    indicator = row["空氣品質指標"]
+    values = (
+        row["測站"], observed_at, parse_number(row["AQI"], "AQI"),
+        None if indicator.upper() in MISSING else indicator,
+        *(parse_number(row[column], column) for column in COLUMNS[4:]),
+    )
+    return dict(zip(MODEL_COLUMNS, values))
+
+
 def read_rows(path: Path, encoding: str = "utf-8-sig") -> Iterator[dict]:
     with path.open("r", encoding=encoding, newline="") as stream:
         reader = csv.DictReader(stream)
@@ -92,37 +109,19 @@ def read_rows(path: Path, encoding: str = "utf-8-sig") -> Iterator[dict]:
             try:
                 if None in raw or any(value is None for value in raw.values()):
                     raise ValueError("資料欄位數量與標題列不符")
-                row = {key: value.strip() for key, value in raw.items()}
-                if not row["測站"]:
-                    raise ValueError("測站不可空白")
-                observed_at = datetime.strptime(row["日期"], "%Y/%m/%d %H:%M")
-                indicator = row["空氣品質指標"]
-                values = (
-                    row["測站"], observed_at, parse_number(row["AQI"], "AQI"),
-                    None if indicator.upper() in MISSING else indicator,
-                    *(parse_number(row[column], column) for column in COLUMNS[4:]),
-                )
-                yield dict(zip(MODEL_COLUMNS, values))
+                yield parse_row(raw)
             except ValueError as exc:
                 raise ValueError(f"{path} 第 {reader.line_num} 行：{exc}") from exc
 
 
-def main() -> int:
-    from config import settings
-
-    parser = build_parser(settings)
-    args = parser.parse_args()
-    if args.batch_size <= 0:
-        parser.error("--batch-size 必須大於 0")
-
-    if args.dry_run:
-        total = 0
-        for path in args.csv_files:
-            count = sum(1 for _ in read_rows(path, args.encoding))
-            total += count
-            print(f"驗證通過：{path}，{count:,} 筆")
-        print(f"共 {total:,} 筆輸入資料；未連線資料庫。")
-        return 0
+def update_rows(rows: Iterable[dict], *, settings=None, batch_size: int | None = None) -> int:
+    """在單一交易中新增或更新已驗證資料，回傳處理筆數。"""
+    if settings is None:
+        from config import settings
+    if batch_size is None:
+        batch_size = settings.batch_size
+    if batch_size <= 0:
+        raise ValueError("batch_size 必須大於 0")
 
     try:
         from sqlalchemy import create_engine
@@ -145,13 +144,12 @@ def main() -> int:
             Base.metadata.create_all(connection)
             with Session(bind=connection) as session:
                 batch = []
-                for path in args.csv_files:
-                    for row in read_rows(path, args.encoding):
-                        batch.append(row)
-                        total += 1
-                        if len(batch) >= args.batch_size:
-                            upsert_batch(session, batch)
-                            batch.clear()
+                for row in rows:
+                    batch.append(row)
+                    total += 1
+                    if len(batch) >= batch_size:
+                        upsert_batch(session, batch)
+                        batch.clear()
                 if batch:
                     upsert_batch(session, batch)
     except SQLAlchemyError as exc:
@@ -163,6 +161,28 @@ def main() -> int:
     finally:
         if engine is not None:
             engine.dispose()
+    return total
+
+
+def main() -> int:
+    from config import settings
+
+    parser = build_parser(settings)
+    args = parser.parse_args()
+    if args.batch_size <= 0:
+        parser.error("--batch-size 必須大於 0")
+
+    if args.dry_run:
+        total = 0
+        for path in args.csv_files:
+            count = sum(1 for _ in read_rows(path, args.encoding))
+            total += count
+            print(f"驗證通過：{path}，{count:,} 筆")
+        print(f"共 {total:,} 筆輸入資料；未連線資料庫。")
+        return 0
+
+    rows = (row for path in args.csv_files for row in read_rows(path, args.encoding))
+    total = update_rows(rows, settings=settings, batch_size=args.batch_size)
     print(f"匯入完成：處理 {total:,} 筆，已提交至 public.air_quality_hourly。")
     print("重複的測站與日期已更新，因此處理筆數不一定等於新增筆數。")
     return 0

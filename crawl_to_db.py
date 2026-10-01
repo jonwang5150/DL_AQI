@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
-"""使用 BeautifulSoup 批次下載臺北市 AQI 小時資料報表。
+"""爬取 AQI，每批直接呼叫 update_db 更新資料庫，不儲存 CSV 或試算表。
 
-網站：https://www.tldep.gov.taipei/Public/DownLoad/AqiHour.aspx
-
-範例：
-    python search_v2.py --stations 中正,大安 --start 2026-08-01 --end 2026-09-06
-    python search_v2.py --stations all --start 2026/08/01 --end 2026/09/06
-
-若沒有提供參數，程式會進入互動模式。網站實際輸出為 Excel 可開啟的
-OpenDocument 試算表（.ods）。
+python crawl_to_db.py --stations all --start 2026-08-01 --end 2026-09-06
+加上 --dry-run 只驗證、不連線資料庫。設定沿用 config.py。
+每個最多 30 天的下載批次各自提交；後續失敗不影響先前批次，可重新爬取更新。
+依賴：requests beautifulsoup4 pandas odfpy SQLAlchemy psycopg[binary]
+Excel 格式另需 openpyxl（xlsx）或 xlrd（xls）。
 """
-
 from __future__ import annotations
 
 import argparse
@@ -20,13 +16,14 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from pathlib import Path
-from typing import Iterable
-from urllib.parse import unquote
+from io import BytesIO
+from typing import Iterable, Iterator
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+import update_db
 
 try:
     from bs4 import BeautifulSoup
@@ -175,29 +172,6 @@ def normalize_station_names(raw: str, available: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-# 抓取 filename*=UTF-8''後面的文字()
-# 或者
-# 抓取 filename=後面的文字
-def extension_from_response(response: requests.Response) -> str:
-    content_type = response.headers.get("Content-Type", "").lower()
-    disposition = response.headers.get("Content-Disposition", "")
-    filename_match = re.search(
-        r"filename\*=UTF-8''([^;]+)|filename=\"?([^\";]+)",
-        disposition,
-        flags=re.IGNORECASE,
-    )
-    if filename_match:
-        filename = unquote(filename_match.group(1) or filename_match.group(2)).strip()
-        suffix = Path(filename).suffix
-        if suffix and re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
-            return suffix.lower()
-    if "spreadsheetml" in content_type:
-        return ".xlsx"
-    if "ms-excel" in content_type:
-        return ".xls"
-    return ".ods"
-
-
 def looks_like_html(response: requests.Response) -> bool:
     content_type = response.headers.get("Content-Type", "").lower()
     prefix = response.content[:512].lstrip().lower()
@@ -224,9 +198,8 @@ def download_batch(
     stations: list[str],
     batch_start: date,
     batch_end: date,
-    output_dir: Path,
     timeout: float,
-) -> Path:
+) -> requests.Response:
     # 每批重新讀取頁面，以取得仍有效的 ViewState 和 EventValidation。
     form = read_form(session, timeout)
     missing = [name for name in stations if name not in form.stations]
@@ -259,108 +232,95 @@ def download_batch(
     if not response.content:
         raise RuntimeError("網站回傳空白檔案")
 
-    suffix = extension_from_response(response)
-    filename = f"aqi_hour_{batch_start:%Y%m%d}_{batch_end:%Y%m%d}{suffix}"
-    destination = output_dir / filename
-    temporary = destination.with_suffix(destination.suffix + ".part")
-    temporary.write_bytes(response.content)
-    temporary.replace(destination)
-    return destination
+    return response
 
 
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="以 BeautifulSoup 下載 AQI 小時資料（每批最多 30 日）"
-    )
-    parser.add_argument(
-        "--stations",
-        help="測站名稱，以逗號分隔；all 代表全部，例如：中正,大安",
-    )
-    parser.add_argument("--start", type=parse_date, help="開始日期，YYYY-MM-DD")
-    parser.add_argument("--end", type=parse_date, help="結束日期，YYYY-MM-DD")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("downloads"),
-        help="下載目錄（預設：downloads）",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=1.0,
-        help="批次之間等待秒數（預設：1）",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=60.0,
-        help="HTTP 請求逾時秒數（預設：60）",
-    )
-    parser.add_argument(
-        "--list-stations",
-        action="store_true",
-        help="列出網站目前的測站後結束",
-    )
+def read_download_rows(content: bytes) -> Iterator[dict]:
+    """在記憶體解析 ODS／Excel，沿用 update_db 的驗證規則。"""
+    try:
+        import pandas as pd
+        frame = pd.read_excel(BytesIO(content), dtype=str, keep_default_na=False)
+    except ImportError as exc:
+        raise RuntimeError("請安裝 pandas odfpy；Excel 格式另需 openpyxl 或 xlrd。") from exc
+    columns = [str(name).strip() for name in frame.columns]
+    if len(set(columns)) != len(columns) or set(columns) != set(update_db.COLUMNS):
+        raise ValueError(f"下載資料欄位必須為 {', '.join(update_db.COLUMNS)}")
+    for line, values in enumerate(frame.itertuples(index=False, name=None), start=2):
+        raw = dict(zip(columns, values))
+        # 原生日期儲存格可能被解析為 ISO 格式文字。
+        try:
+            raw["日期"] = datetime.fromisoformat(raw["日期"]).strftime("%Y/%m/%d %H:%M")
+        except ValueError:
+            pass
+        try:
+            yield update_db.parse_row(raw)
+        except ValueError as exc:
+            raise ValueError(f"下載資料第 {line} 行：{exc}") from exc
+
+
+def build_argument_parser(settings) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--stations", help="測站名稱，以逗號分隔；all 代表全部")
+    parser.add_argument("--start", type=parse_date, help="開始日期：YYYY-MM-DD")
+    parser.add_argument("--end", type=parse_date, help="結束日期：YYYY-MM-DD")
+    parser.add_argument("--delay", type=float, default=1.0, help="批次間等待秒數（預設：1）")
+    parser.add_argument("--timeout", type=float, default=60.0, help="HTTP 逾時秒數（預設：60）")
+    parser.add_argument("--list-stations", action="store_true", help="列出測站後結束")
+    parser.add_argument("--batch-size", type=int, default=settings.batch_size, help="每批資料庫寫入筆數")
+    parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=settings.dry_run,
+                        help="只驗證；--no-dry-run 強制執行匯入")
     return parser
 
 
 def main() -> int:
-    args = build_argument_parser().parse_args()
-    if BeautifulSoup is None:
-        raise RuntimeError("缺少套件，請先執行：pip install beautifulsoup4")
+    from config import settings
+
+    parser = build_argument_parser(settings)
+    args = parser.parse_args()
     if args.delay < 0:
-        raise ValueError("--delay 不可小於 0")
+        parser.error("--delay 不可小於 0")
     if args.timeout <= 0:
-        raise ValueError("--timeout 必須大於 0")
+        parser.error("--timeout 必須大於 0")
+    if args.batch_size <= 0:
+        parser.error("--batch-size 必須大於 0")
 
-    session = make_session()
-    try:
-        initial_form = read_form(session, args.timeout)
-        available = list(initial_form.stations)
-
+    with make_session() as session:
+        available = list(read_form(session, args.timeout).stations)
         if args.list_stations:
             print("可用測站：" + "、".join(available))
             return 0
-
         station_input = args.stations
         if station_input is None:
             print("可用測站：" + "、".join(available))
-            station_input = input("請輸入測站（逗號分隔，all 代表全部）：")
+            station_input = input("請輸入測站（逗號分隔；all 代表全部）：")
         stations = normalize_station_names(station_input, available)
-
         start = args.start or parse_date(input("開始日期（YYYY-MM-DD）："))
         end = args.end or parse_date(input("結束日期（YYYY-MM-DD）："))
         batches = list(split_date_range(start, end))
-
-        args.output.mkdir(parents=True, exist_ok=True)
-        print(f"測站：{', '.join(stations)}")
-        print(f"日期：{start} 至 {end}，共 {len(batches)} 批")
-
-        downloaded: list[Path] = []
+        total = 0
         for index, (batch_start, batch_end) in enumerate(batches, start=1):
-            print(f"[{index}/{len(batches)}] 下載 {batch_start} 至 {batch_end} ...", flush=True)
-            path = download_batch(
-                session,
-                stations,
-                batch_start,
-                batch_end,
-                args.output,
-                args.timeout,
-            )
-            downloaded.append(path)
-            print(f"    完成：{path} ({path.stat().st_size:,} bytes)")
+            print(f"[{index}/{len(batches)}] 爬取 {batch_start} 至 {batch_end} ...", flush=True)
+            try:
+                with download_batch(session, stations, batch_start, batch_end, args.timeout) as response:
+                    rows = read_download_rows(response.content)
+                    if args.dry_run:
+                        count = sum(1 for _ in rows)
+                    else:
+                        count = update_db.update_rows(rows, settings=settings, batch_size=args.batch_size)
+            except (requests.RequestException, OSError, RuntimeError, ValueError) as exc:
+                raise RuntimeError(f"批次 {batch_start} 至 {batch_end} 失敗：{exc}") from exc
+            total += count
+            action = "驗證通過" if args.dry_run else "已提交至資料庫"
+            print(f"    {action}：{count:,} 筆")
             if index < len(batches) and args.delay:
                 time.sleep(args.delay)
-
-        print(f"全部完成，共下載 {len(downloaded)} 個檔案。")
-        return 0
-    finally:
-        session.close()
+        print(f"全部完成：共 {total:,} 筆" + ("；未連線資料庫。" if args.dry_run else "。"))
+    return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (requests.RequestException, OSError, RuntimeError, ValueError) as exc:
+    except (requests.RequestException, OSError, RuntimeError, ValueError, LookupError) as exc:
         print(f"錯誤：{exc}", file=sys.stderr)
         raise SystemExit(1)
