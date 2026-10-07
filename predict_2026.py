@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import pickle
-from pyexpat import features
 import sys
 from pathlib import Path
 
@@ -15,8 +14,8 @@ import torch
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import SQLAlchemyError
 
+import update_db
 from config import settings
-from csv_to_postgres import database_url_from_settings
 from db_models import AirQualityHourly
 from pipeline_v1.model import LSTMModel
 from predict_feture import predict_period
@@ -27,13 +26,6 @@ PREDICTION_START = pd.Timestamp("2026-01-01 00:00:00")
 PREDICTION_END = pd.Timestamp("2026-08-01 00:00:00")
 
 
-def default_output_path() -> Path:
-    """依預測起訖日期產生預設輸出檔名。"""
-    start_text = PREDICTION_START.strftime("%Y%m%d")
-    end_text = PREDICTION_END.strftime("%Y%m%d")
-    return PROJECT_DIR / f"{start_text}-{end_text}_predict.csv"
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--station", default="木柵站", help="資料庫中的測站名稱")
@@ -42,12 +34,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=PROJECT_DIR / "aqi_lstm_model.pth",
         help="模型 checkpoint 路徑",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=default_output_path(),
-        help="預測結果 CSV 路徑",
     )
     return parser
 
@@ -117,7 +103,7 @@ def load_database_data(station: str, query_start: pd.Timestamp) -> pd.DataFrame:
     )
 
     engine = create_engine(
-        database_url_from_settings(settings),
+        update_db.database_url_from_settings(settings),
         connect_args={"connect_timeout": 10},
         hide_parameters=True,
     )
@@ -195,13 +181,19 @@ def main() -> int:
     if len(result) != expected_count:
         raise RuntimeError(f"預期產生 {expected_count} 筆預測，實際只有 {len(result)} 筆")
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(args.output, index=False, encoding="utf-8-sig", float_format="%.4f")
+    prediction_rows = (
+        update_db.parse_prediction_row({**raw, "測站": args.station})
+        for raw in result.to_dict(orient="records")
+    )
+    written_count = update_db.update_prediction_rows(
+        prediction_rows,
+        settings=settings,
+    )
     print(f"測站：{args.station}")
     print(f"預測時段：{PREDICTION_START} 至 {PREDICTION_END}（不含結束時間）")
     print(f"補齊缺少的逐時資料：{missing_hours} 筆")
     print(f"污染物欄位前向補值：{missing_before} 格")
-    print(f"完成 {len(result)} 筆逐時 AQI 預測：{args.output.resolve()}")
+    print(f"完成 {written_count} 筆逐時 AQI 預測，已寫入 public.air_quality_predictions。")
     return 0
 
 
