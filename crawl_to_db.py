@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""爬取 AQI，每批直接呼叫 update_db 更新資料庫，不儲存 CSV 或試算表。
+"""爬取 AQI，將每批結果直接驗證並更新資料庫，不儲存中間檔案。
 
 python crawl_to_db.py --stations all --start 2026-08-01 --end 2026-09-06
 加上 --dry-run 只驗證、不連線資料庫。設定沿用 config.py。
@@ -235,8 +235,8 @@ def download_batch(
     return response
 
 
-def read_download_rows(content: bytes) -> Iterator[dict]:
-    """在記憶體解析 ODS／Excel，沿用 update_db 的驗證規則。"""
+def parse_download_rows(content: bytes) -> Iterator[dict]:
+    """在記憶體解析網站回傳的試算表，產生可直接寫入資料庫的資料。"""
     try:
         import pandas as pd
         frame = pd.read_excel(BytesIO(content), dtype=str, keep_default_na=False)
@@ -302,7 +302,7 @@ def main() -> int:
             print(f"[{index}/{len(batches)}] 爬取 {batch_start} 至 {batch_end} ...", flush=True)
             try:
                 with download_batch(session, stations, batch_start, batch_end, args.timeout) as response:
-                    rows = read_download_rows(response.content)
+                    rows = parse_download_rows(response.content)
                     if args.dry_run:
                         count = sum(1 for _ in rows)
                     else:

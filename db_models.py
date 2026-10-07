@@ -28,6 +28,18 @@ class AirQualityHourly(Base):
     no2: Mapped[Decimal | None] = mapped_column(Numeric)
 
 
+class AirQualityPrediction(Base):
+    """逐時 AQI 預測；同一測站、同一時間只保留最新結果。"""
+
+    __tablename__ = "air_quality_predictions"
+    __table_args__ = {"schema": "public"}
+
+    station: Mapped[str] = mapped_column(Text, primary_key=True)
+    predicted_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), primary_key=True)
+    predicted_aqi: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    actual_aqi: Mapped[Decimal | None] = mapped_column(Numeric)
+
+
 def upsert_batch(session: Session, rows: list[dict]) -> None:
     if not rows:
         return
@@ -43,6 +55,23 @@ def upsert_batch(session: Session, rows: list[dict]) -> None:
                 column.name: statement.excluded[column.name]
                 for column in AirQualityHourly.__table__.columns
                 if not column.primary_key
+            },
+        )
+        session.execute(statement)
+
+
+def upsert_prediction_batch(session: Session, rows: list[dict]) -> None:
+    if not rows:
+        return
+    unique = {(row["station"], row["predicted_at"]): row for row in rows}
+    values = list(unique.values())
+    for offset in range(0, len(values), 1000):
+        statement = insert(AirQualityPrediction).values(values[offset:offset + 1000])
+        statement = statement.on_conflict_do_update(
+            index_elements=[AirQualityPrediction.station, AirQualityPrediction.predicted_at],
+            set_={
+                "predicted_aqi": statement.excluded.predicted_aqi,
+                "actual_aqi": statement.excluded.actual_aqi,
             },
         )
         session.execute(statement)
