@@ -1,34 +1,27 @@
 #!/usr/bin/env python3
-"""將 AQI CSV 匯入 PostgreSQL（Python 3.10+）。
+"""驗證 AQI 爬蟲資料並寫入 PostgreSQL（Python 3.10+）。
 
 安裝：python -m pip install "SQLAlchemy>=2.0,<2.1" "psycopg[binary]>=3,<4"
-設定：修改 config.py 的資料庫連線網址與 Settings 內的匯入設定。
-執行：直接在 IDE 執行本檔，或 python update_db.py。
-匯入：python update_db.py 20250101-20251231.csv
-檢查：python update_db.py 20250101-20251231.csv --dry-run
+設定：修改 config.py 的資料庫連線網址與每批寫入筆數。
+本模組由 crawl_to_db.py 呼叫，不讀寫中間檔案。
 
 資料庫須先建立；程式會建立 public.air_quality_hourly 資料表。
-日期保留 CSV 的台灣當地時間，不進行時區轉換。
+日期保留來源資料的台灣當地時間，不進行時區轉換。
 相同測站與日期會更新為最後讀到的資料（包含 NULL）。
-所有輸入檔案在同一交易內匯入；任一筆失敗會全部回復。
+每次 update_rows 呼叫會使用單一交易；任一筆失敗會全部回復。
 """
 
 from __future__ import annotations
 
-import argparse
-import csv
-import sys
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable
 
 
 COLUMNS = ["測站", "日期", "AQI", "空氣品質指標", "O3", "PM2.5", "PM10", "CO", "SO2", "NO2"]
 MISSING = {"", "-", "--", "NA", "N/A", "NULL", "NAN"}
 
 MODEL_COLUMNS = ["station", "observed_at", "aqi", "air_quality_indicator", "o3", "pm25", "pm10", "co", "so2", "no2"]
-PROJECT_DIR = Path(__file__).resolve().parent
 
 
 def database_url_from_settings(settings):
@@ -51,21 +44,6 @@ def database_url_from_settings(settings):
         ) from exc
 
 
-def build_parser(settings) -> argparse.ArgumentParser:
-    default_csv = Path(settings.csv_path)
-    if not default_csv.is_absolute():
-        default_csv = PROJECT_DIR / default_csv
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("csv_files", nargs="*", type=Path, default=[default_csv])
-    parser.add_argument("--encoding", default=settings.csv_encoding, help="覆蓋 config.py 的 CSV 編碼")
-    parser.add_argument("--batch-size", type=int, default=settings.batch_size, help="覆蓋 config.py 的每批筆數")
-    parser.add_argument(
-        "--dry-run", action=argparse.BooleanOptionalAction, default=settings.dry_run,
-        help="只驗證 CSV；--no-dry-run 可覆蓋設定並執行匯入",
-    )
-    return parser
-
-
 def parse_number(value: str, column: str) -> Decimal | None:
     if value.upper() in MISSING:
         return None
@@ -79,7 +57,7 @@ def parse_number(value: str, column: str) -> Decimal | None:
 
 
 def parse_row(raw: dict[str, str]) -> dict:
-    """CSV 與爬蟲共用的資料驗證與轉換。"""
+    """將爬蟲取得的一列資料驗證並轉成資料庫欄位。"""
     if set(raw) != set(COLUMNS):
         raise ValueError("資料欄位與預期不符")
     row = {key: value.strip() for key, value in raw.items()}
@@ -93,25 +71,6 @@ def parse_row(raw: dict[str, str]) -> dict:
         *(parse_number(row[column], column) for column in COLUMNS[4:]),
     )
     return dict(zip(MODEL_COLUMNS, values))
-
-
-def read_rows(path: Path, encoding: str = "utf-8-sig") -> Iterator[dict]:
-    with path.open("r", encoding=encoding, newline="") as stream:
-        reader = csv.DictReader(stream)
-        if reader.fieldnames is None:
-            raise ValueError(f"{path}：CSV 沒有標題列")
-        reader.fieldnames = [name.strip() for name in reader.fieldnames]
-        if len(set(reader.fieldnames)) != len(reader.fieldnames):
-            raise ValueError(f"{path}：CSV 欄位名稱重複")
-        if set(reader.fieldnames) != set(COLUMNS):
-            raise ValueError(f"{path}：CSV 欄位必須為 {', '.join(COLUMNS)}")
-        for raw in reader:
-            try:
-                if None in raw or any(value is None for value in raw.values()):
-                    raise ValueError("資料欄位數量與標題列不符")
-                yield parse_row(raw)
-            except ValueError as exc:
-                raise ValueError(f"{path} 第 {reader.line_num} 行：{exc}") from exc
 
 
 def update_rows(rows: Iterable[dict], *, settings=None, batch_size: int | None = None) -> int:
@@ -162,35 +121,3 @@ def update_rows(rows: Iterable[dict], *, settings=None, batch_size: int | None =
         if engine is not None:
             engine.dispose()
     return total
-
-
-def main() -> int:
-    from config import settings
-
-    parser = build_parser(settings)
-    args = parser.parse_args()
-    if args.batch_size <= 0:
-        parser.error("--batch-size 必須大於 0")
-
-    if args.dry_run:
-        total = 0
-        for path in args.csv_files:
-            count = sum(1 for _ in read_rows(path, args.encoding))
-            total += count
-            print(f"驗證通過：{path}，{count:,} 筆")
-        print(f"共 {total:,} 筆輸入資料；未連線資料庫。")
-        return 0
-
-    rows = (row for path in args.csv_files for row in read_rows(path, args.encoding))
-    total = update_rows(rows, settings=settings, batch_size=args.batch_size)
-    print(f"匯入完成：處理 {total:,} 筆，已提交至 public.air_quality_hourly。")
-    print("重複的測站與日期已更新，因此處理筆數不一定等於新增筆數。")
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (OSError, ValueError, RuntimeError, LookupError) as exc:
-        print(f"錯誤：{exc}", file=sys.stderr)
-        raise SystemExit(1)
