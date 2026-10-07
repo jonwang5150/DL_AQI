@@ -3,7 +3,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Numeric, Text
+from sqlalchemy import CheckConstraint, DateTime, Integer, Numeric, Text, func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
@@ -40,38 +40,57 @@ class AirQualityPrediction(Base):
     actual_aqi: Mapped[Decimal | None] = mapped_column(Numeric)
 
 
-def upsert_batch(session: Session, rows: list[dict]) -> None:
+class AirQualityPrediction8h(Base):
+    """同一目標時間保留各提前小時與模型版本，不重複儲存真實 AQI。"""
+
+    __tablename__ = "air_quality_predictions_8h"
+    __table_args__ = (
+        CheckConstraint("horizon_hours BETWEEN 1 AND 8", name="ck_prediction_8h_horizon"),
+        {"schema": "public"},
+    )
+
+    station: Mapped[str] = mapped_column(Text, primary_key=True)
+    target_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), primary_key=True)
+    horizon_hours: Mapped[int] = mapped_column(Integer, primary_key=True)
+    model_version: Mapped[str] = mapped_column(Text, primary_key=True)
+    predicted_aqi: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+def _upsert_model_batch(
+    session: Session, rows: list[dict], model: type[Base]
+) -> None:
+    """依模型主鍵去重並批次 upsert；衝突時更新所有非主鍵欄位，不提交交易。"""
     if not rows:
         return
+    table = model.__table__
+    keys = [column.name for column in table.primary_key.columns]
     # PostgreSQL 單一 INSERT 不可更新同一鍵兩次；保留每個鍵最後讀到的資料。
-    unique = {(row["station"], row["observed_at"]): row for row in rows}
+    unique = {tuple(row[key] for key in keys): row for row in rows}
     values = list(unique.values())
     # 控制單次 SQL 的參數數量，即使使用者指定較大的 batch-size 也可執行。
     for offset in range(0, len(values), 1000):
-        statement = insert(AirQualityHourly).values(values[offset:offset + 1000])
+        statement = insert(model).values(values[offset:offset + 1000])
         statement = statement.on_conflict_do_update(
-            index_elements=[AirQualityHourly.station, AirQualityHourly.observed_at],
+            index_elements=keys,
             set_={
                 column.name: statement.excluded[column.name]
-                for column in AirQualityHourly.__table__.columns
+                for column in table.columns
                 if not column.primary_key
             },
         )
         session.execute(statement)
 
 
+def upsert_batch(session: Session, rows: list[dict]) -> None:
+    _upsert_model_batch(session, rows, AirQualityHourly)
+
+
 def upsert_prediction_batch(session: Session, rows: list[dict]) -> None:
-    if not rows:
-        return
-    unique = {(row["station"], row["predicted_at"]): row for row in rows}
-    values = list(unique.values())
-    for offset in range(0, len(values), 1000):
-        statement = insert(AirQualityPrediction).values(values[offset:offset + 1000])
-        statement = statement.on_conflict_do_update(
-            index_elements=[AirQualityPrediction.station, AirQualityPrediction.predicted_at],
-            set_={
-                "predicted_aqi": statement.excluded.predicted_aqi,
-                "actual_aqi": statement.excluded.actual_aqi,
-            },
-        )
-        session.execute(statement)
+    _upsert_model_batch(session, rows, AirQualityPrediction)
+
+
+def upsert_prediction_8h_batch(session: Session, rows: list[dict]) -> None:
+    _upsert_model_batch(session, rows, AirQualityPrediction8h)
