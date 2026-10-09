@@ -133,6 +133,7 @@ def predict_period(model, inputs, window_size, horizon, start, end, batch_size=2
     with torch.inference_mode():
         for offset in range(0, len(origins), batch_size):
             stop = min(offset + batch_size, len(origins))
+            # windows.shape==(256,24,特徵數)
             windows = np.stack([inputs[i:i + window_size] for i in range(offset, stop)])
             predictions = model(torch.from_numpy(windows.astype(np.float32))).cpu().numpy()
             if predictions.shape != (stop - offset, horizon) or not np.isfinite(predictions).all():
